@@ -1055,15 +1055,20 @@ rcl_interfaces::msg::SetParametersResult RPlidarNode::parameters_callback(
     // --------------------------------------------------------------------
     else if (param.get_name() == "auto_standby" &&
              param.get_type() == rclcpp::ParameterType::PARAMETER_BOOL) {
-      params_.auto_standby = param.as_bool();
-      auto_standby_enabled_.store(params_.auto_standby);
-
-      // Turning it off must not leave the device parked in an automatic
-      // standby nobody can leave through the services.
-      if (!params_.auto_standby) {
-        auto_standby_engaged_.store(false);
-        standby_requested_.store(false);
+      const bool enabled = param.as_bool();
+      if (enabled == params_.auto_standby) {
+        continue; // No change.
       }
+      params_.auto_standby = enabled;
+      auto_standby_enabled_.store(enabled);
+
+      // Whichever owner takes over decides from scratch: the flag that is no
+      // longer authoritative must not latch, and handing the motor to
+      // 'auto_standby' while nobody listens must not cost a spin-up.
+      standby_requested_.store(false);
+      auto_standby_engaged_.store(
+          enabled && current_state_.load() == DriverState::STANDBY &&
+          count_output_subscribers() == 0);
 
       RCLCPP_INFO(this->get_logger(), "[Dynamic] Auto standby: %s",
                   params_.auto_standby ? "ON" : "OFF");
