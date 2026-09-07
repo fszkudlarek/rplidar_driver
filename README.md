@@ -97,6 +97,10 @@ ros2 param set /rplidar_node auto_standby true
 While `auto_standby` is enabled the two services are rejected, so the
 subscriber count stays the single source of truth.
 
+Toggling the parameter hands the motor over, and the new owner decides from
+scratch: a pending `stop_motor` standby is dropped, and switching back off
+leaves the motor running.
+
 Diagnostics say *why* the motor is idle, which is usually the question:
 
 ```bash
