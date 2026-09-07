@@ -9,6 +9,8 @@
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <string>
+#include <vector>
 
 #include "rplidar_node.hpp"
 
@@ -485,4 +487,238 @@ TEST_F(RplidarNodeTest, StandbyServiceRefusedWhileInactive) {
   // Clean shutdown
   node->trigger_transition(
       rclcpp_lifecycle::Transition(Transition::TRANSITION_CLEANUP));
+}
+
+/**
+ * @brief [Behavioral Test] Enabling 'auto_standby' takes the motor over
+ * Toggling the parameter hands ownership of the motor to the subscriber count,
+ * so a standby left behind by 'stop_motor' must not survive the switch: with a
+ * subscriber connected, the device has to wake up again.
+ *
+ * Without the handover the driver would be stuck: the manual flag keeps it
+ * parked while 'start_motor' is refused for as long as 'auto_standby' is on.
+ *
+ * Setting the parameter to the value it already has must change nothing, which
+ * is checked first so that a wrongly cleared flag cannot pass as a success.
+ */
+TEST_F(RplidarNodeTest, AutoStandbyEnableClearsManualStandby) {
+  // ==========================================================================
+  // [Arrange] Active node in dummy mode, 'auto_standby' off, one subscriber
+  // ==========================================================================
+  rclcpp::NodeOptions options;
+  options.append_parameter_override("dummy_mode", true);
+  options.append_parameter_override("auto_standby", false);
+
+  auto node = std::make_shared<rplidar_driver::RPlidarNode>(options);
+  auto client_node = std::make_shared<rclcpp::Node>("standby_handover_client");
+
+  node->trigger_transition(
+      rclcpp_lifecycle::Transition(Transition::TRANSITION_CONFIGURE));
+  node->trigger_transition(
+      rclcpp_lifecycle::Transition(Transition::TRANSITION_ACTIVATE));
+
+  std::atomic<int> scan_count{0};
+  auto scan_sub = client_node->create_subscription<sensor_msgs::msg::LaserScan>(
+      "scan", rclcpp::SensorDataQoS(),
+      [&scan_count](sensor_msgs::msg::LaserScan::SharedPtr) { scan_count++; });
+
+  auto stop_client =
+      client_node->create_client<std_srvs::srv::Trigger>("stop_motor");
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(node->get_node_base_interface());
+  executor.add_node(client_node);
+
+  auto spin_for = [&executor](std::chrono::milliseconds duration) {
+    const auto deadline = std::chrono::steady_clock::now() + duration;
+    while (rclcpp::ok() && std::chrono::steady_clock::now() < deadline) {
+      executor.spin_some();
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  };
+
+  // Pump the executor until scans arrive, or give up after 'timeout'.
+  auto wait_for_scans = [&](std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (rclcpp::ok() && std::chrono::steady_clock::now() < deadline) {
+      executor.spin_some();
+      if (scan_count.load() > 0) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return false;
+  };
+
+  ASSERT_TRUE(wait_for_scans(std::chrono::seconds(3)))
+      << "No scans published before the standby request.";
+
+  // ==========================================================================
+  // [Act & Assert] 1. 'stop_motor' parks the device
+  // ==========================================================================
+  ASSERT_TRUE(stop_client->wait_for_service(std::chrono::seconds(3)));
+  auto future = stop_client->async_send_request(
+      std::make_shared<std_srvs::srv::Trigger::Request>());
+  ASSERT_EQ(
+      executor.spin_until_future_complete(future, std::chrono::seconds(3)),
+      rclcpp::FutureReturnCode::SUCCESS);
+  ASSERT_TRUE(future.get()->success) << "'stop_motor' was refused.";
+
+  spin_for(std::chrono::milliseconds(500));
+  scan_count = 0;
+  spin_for(std::chrono::milliseconds(500));
+  ASSERT_EQ(scan_count.load(), 0) << "Scans still published after stop_motor.";
+
+  // ==========================================================================
+  // [Act & Assert] 2. Re-setting the parameter to 'false' is a no-op
+  // ==========================================================================
+  auto unchanged = node->set_parameter(rclcpp::Parameter("auto_standby", false));
+  EXPECT_TRUE(unchanged.successful) << unchanged.reason;
+
+  scan_count = 0;
+  spin_for(std::chrono::seconds(1));
+  EXPECT_EQ(scan_count.load(), 0)
+      << "Setting 'auto_standby' to its current value must not wake the motor.";
+
+  // ==========================================================================
+  // [Act & Assert] 3. Enabling 'auto_standby' hands the motor to the demand
+  // ==========================================================================
+  auto enabled = node->set_parameter(rclcpp::Parameter("auto_standby", true));
+  ASSERT_TRUE(enabled.successful) << enabled.reason;
+
+  scan_count = 0;
+  EXPECT_TRUE(wait_for_scans(std::chrono::seconds(5)))
+      << "The driver stayed parked after 'auto_standby' was enabled, even "
+      << "though a subscriber is connected.";
+
+  // Clean shutdown
+  node->trigger_transition(
+      rclcpp_lifecycle::Transition(Transition::TRANSITION_DEACTIVATE));
+}
+
+/**
+ * @brief [Behavioral Test] The handover costs no spin-up
+ * Same handover as above, but without a subscriber: the motor must stay off.
+ * Waking up only to park again one poll later would spin the motor for
+ * nothing, so the driver is watched through '/diagnostics' for the whole
+ * settling window instead of only at the end.
+ */
+TEST_F(RplidarNodeTest, AutoStandbyEnableKeepsMotorParkedWithoutSubscribers) {
+  // ==========================================================================
+  // [Arrange] Active node in dummy mode, nobody subscribing to 'scan'
+  // ==========================================================================
+  rclcpp::NodeOptions options;
+  options.append_parameter_override("dummy_mode", true);
+  options.append_parameter_override("auto_standby", false);
+  // Sample fast enough to catch a short spin-up.
+  options.append_parameter_override("diagnostic_updater.period", 0.05);
+
+  auto node = std::make_shared<rplidar_driver::RPlidarNode>(options);
+  auto client_node = std::make_shared<rclcpp::Node>("standby_no_blip_client");
+
+  node->trigger_transition(
+      rclcpp_lifecycle::Transition(Transition::TRANSITION_CONFIGURE));
+  node->trigger_transition(
+      rclcpp_lifecycle::Transition(Transition::TRANSITION_ACTIVATE));
+
+  // Every summary the driver status task reported, in order, without repeats.
+  std::vector<std::string> summaries;
+  std::mutex summary_mutex;
+  auto diag_sub =
+      client_node->create_subscription<diagnostic_msgs::msg::DiagnosticArray>(
+          "/diagnostics", 10,
+          [&](diagnostic_msgs::msg::DiagnosticArray::SharedPtr msg) {
+            for (const auto &status : msg->status) {
+              if (status.name.find("RPLidar Status") == std::string::npos) {
+                continue;
+              }
+              std::lock_guard<std::mutex> lock(summary_mutex);
+              if (summaries.empty() || summaries.back() != status.message) {
+                summaries.push_back(status.message);
+              }
+            }
+          });
+
+  auto stop_client =
+      client_node->create_client<std_srvs::srv::Trigger>("stop_motor");
+
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(node->get_node_base_interface());
+  executor.add_node(client_node);
+
+  auto spin_for = [&executor](std::chrono::milliseconds duration) {
+    const auto deadline = std::chrono::steady_clock::now() + duration;
+    while (rclcpp::ok() && std::chrono::steady_clock::now() < deadline) {
+      executor.spin_some();
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  };
+
+  auto last_summary = [&]() {
+    std::lock_guard<std::mutex> lock(summary_mutex);
+    return summaries.empty() ? std::string() : summaries.back();
+  };
+
+  // Pump the executor until the latest summary contains 'needle'.
+  auto wait_for_summary = [&](const std::string &needle,
+                              std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (rclcpp::ok() && std::chrono::steady_clock::now() < deadline) {
+      executor.spin_some();
+      if (last_summary().find(needle) != std::string::npos) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return false;
+  };
+
+  ASSERT_TRUE(wait_for_summary("Scanning", std::chrono::seconds(5)))
+      << "Driver never reached the scanning state. Last summary: '"
+      << last_summary() << "'";
+
+  // ==========================================================================
+  // [Act & Assert] 1. 'stop_motor' parks the device
+  // ==========================================================================
+  ASSERT_TRUE(stop_client->wait_for_service(std::chrono::seconds(3)));
+  auto future = stop_client->async_send_request(
+      std::make_shared<std_srvs::srv::Trigger::Request>());
+  ASSERT_EQ(
+      executor.spin_until_future_complete(future, std::chrono::seconds(3)),
+      rclcpp::FutureReturnCode::SUCCESS);
+  ASSERT_TRUE(future.get()->success) << "'stop_motor' was refused.";
+
+  ASSERT_TRUE(wait_for_summary("Standby (motor off)", std::chrono::seconds(5)))
+      << "Driver did not park on request. Last summary: '" << last_summary()
+      << "'";
+
+  // ==========================================================================
+  // [Act & Assert] 2. Enabling 'auto_standby' must not restart the motor
+  // ==========================================================================
+  {
+    std::lock_guard<std::mutex> lock(summary_mutex);
+    summaries.clear();
+  }
+
+  auto enabled = node->set_parameter(rclcpp::Parameter("auto_standby", true));
+  ASSERT_TRUE(enabled.successful) << enabled.reason;
+
+  spin_for(std::chrono::seconds(2));
+
+  std::lock_guard<std::mutex> lock(summary_mutex);
+  for (const auto &summary : summaries) {
+    EXPECT_EQ(summary.find("Scanning"), std::string::npos)
+        << "The motor was restarted during the handover: '" << summary << "'";
+    EXPECT_EQ(summary.find("Warming Up"), std::string::npos)
+        << "The motor was restarted during the handover: '" << summary << "'";
+  }
+
+  ASSERT_FALSE(summaries.empty()) << "No diagnostics seen after the handover.";
+  EXPECT_NE(summaries.back().find("auto: no subscribers"), std::string::npos)
+      << "'auto_standby' should own the standby once it is enabled. Got: '"
+      << summaries.back() << "'";
+
+  // Clean shutdown
+  node->trigger_transition(
+      rclcpp_lifecycle::Transition(Transition::TRANSITION_DEACTIVATE));
 }
